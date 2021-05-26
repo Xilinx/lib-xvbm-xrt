@@ -1,0 +1,12 @@
+prefix=@CMAKE_INSTALL_PREFIX@
+exec_prefix=${prefix}
+libdir=${prefix}/lib
+includedir=${prefix}/include
+
+Name: libxvbm
+Description: Xilinx Video Buffer Manager 
+Version: 0.0.1
+Requires: xrt >= 2.1.92
+Libs: -L${libdir} -lxvbm -lstdc++
+Cflags: -I${includedir}
+

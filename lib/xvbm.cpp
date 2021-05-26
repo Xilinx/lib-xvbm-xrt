@@ -1,0 +1,457 @@
+/* SPDX-License-Identifier: LGPL-3.0-or-later OR Apache-2.0 */
+
+/*
+ * Copyright (C) 2019-2021 Xilinx Inc - All rights reserved
+ * Xilinx Video Buffer Manager (Xvbm)
+ *
+ * This file is dual-licensed; you may select either the GNU
+ * Lesser General Public License version 3 or
+ * Apache License, Version 2.0.
+ *
+ */
+
+#include <assert.h>
+#include <stdlib.h>
+#include <string.h>
+#include "xvbm.h"
+#include "xvbm_private.h"
+
+#define ALIGN_4K        4096
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for creating a buffer 
+//////////////////////////////////////////////////////////////////////////////
+XvbmBuffer* XvbmBufferPool::create_buffer(int32_t index)
+{
+    void *host_ptr = nullptr;
+    uint32_t bo_handle;
+    int rc = -1;
+
+    //allocate host buffer (4K aligned)
+    if(posix_memalign(&host_ptr, ALIGN_4K, m_size)) {
+        std::cout << "xvbm : aligned alloc failed" << std::endl;
+        throw std::bad_alloc();
+    }
+    memset(host_ptr, 0, m_size);
+
+    bo_handle = xclAllocUserPtrBO(m_dev_handle,
+                                  host_ptr,
+                                  m_size,
+                                  m_flags);
+    if (bo_handle == NULLBO) {
+        std::cout << "xvbm : xclAllocBO failed" << std::endl;
+        throw std::bad_alloc();
+    }
+
+    rc = xclSyncBO(m_dev_handle,
+                   bo_handle,
+                   XCL_BO_SYNC_BO_TO_DEVICE,
+                   m_size,
+                   0);
+
+    if (rc != 0) {
+        std::cout << "xvbm : initialize device buffer with 0 failed" << std::endl;
+        xclFreeBO(m_dev_handle, bo_handle);
+        free(host_ptr);
+        throw std::bad_alloc();
+    }
+
+    uint64_t paddr = xclGetDeviceAddr(m_dev_handle, bo_handle);
+    XvbmBuffer *buffer = new XvbmBuffer(this, bo_handle, index, m_size, paddr, host_ptr);
+    assert(buffer != nullptr);
+    m_alloc_vector.push_back(buffer);
+    m_paddr_map.insert(std::pair<uint64_t, XvbmBuffer*>(paddr, buffer));
+    m_free_list.push_back(buffer);
+
+    return buffer;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for creating the buffer pool
+//////////////////////////////////////////////////////////////////////////////
+void XvbmBufferPool::create()
+{
+    int32_t i;
+    
+    std::lock_guard<std::mutex> guard(m_lock);
+
+    for (i = 0; i < m_num_buffers; i++) {
+        try {
+            create_buffer(i);
+        } catch (const std::bad_alloc&) {
+            std::cout <<  "buffer #" << i << "failed" << std::endl;
+            throw std::bad_alloc();
+        }
+    }
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for extending a buffer pool
+//////////////////////////////////////////////////////////////////////////////
+int32_t XvbmBufferPool::extend(int32_t num_buffers)
+{
+    int32_t i;
+
+    std::lock_guard<std::mutex> guard(m_lock);
+
+    for (i = m_num_buffers; i < m_num_buffers+num_buffers; i++) {
+        try {
+            create_buffer(i);
+        } catch (const std::bad_alloc&) {
+            std::cout <<  i << "th buffer allocation failed during extension" << std::endl;
+            throw std::bad_alloc();
+        }
+    }
+
+    m_num_buffers += num_buffers;
+
+    return m_num_buffers;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for allocating a buffer from the buffer pool 
+//////////////////////////////////////////////////////////////////////////////
+XvbmBuffer* XvbmBufferPool::entry_alloc()
+{
+    XvbmBuffer *buffer = NULL;
+
+    std::lock_guard<std::mutex> guard(m_lock);
+
+    if (m_free_list.size())
+    {
+        buffer = m_free_list.front();
+        ++buffer->m_ref_cnt;
+        std::lock_guard<std::mutex> guard(buffer->m_rdlock);
+        buffer->m_hbuf_valid = false;
+        m_free_list.pop_front();
+        m_inuse_list.push_back(buffer);
+    }
+
+    return buffer;
+}
+    
+//////////////////////////////////////////////////////////////////////////////
+// Class method for freeing a buffer back to the buffer pool 
+//////////////////////////////////////////////////////////////////////////////
+bool XvbmBufferPool::entry_free(XvbmBuffer *buffer)
+{
+    bool ret = false;
+
+    std::lock_guard<std::mutex> guard(m_lock);
+
+    if (buffer->m_ref_cnt > 0) {
+        --buffer->m_ref_cnt;
+
+        if (buffer->m_ref_cnt == 0) {
+            auto it = std::find(m_inuse_list.begin(), m_inuse_list.end(), buffer);
+            if (it != m_inuse_list.end())
+            {
+                m_inuse_list.erase(it);
+                m_free_list.push_back(buffer);
+                ret = true;
+            }
+        }
+    }
+    return ret;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for getting the buffer handle by physical address
+//////////////////////////////////////////////////////////////////////////////
+XvbmBuffer* XvbmBufferPool::get_handle_by_paddr(uint64_t paddr)
+{
+    XvbmBuffer* buffer = (XvbmBuffer*)NULL;
+ 
+    std::lock_guard<std::mutex> guard(m_lock);
+    auto it = m_paddr_map.find(paddr);
+    if (it != m_paddr_map.end())
+        buffer = it->second;
+
+    return buffer;
+}
+
+/* XHD CHANGES */
+XvbmPoolHandle xvbm_get_pool_handle(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+
+    return p_handle;
+}
+
+XvbmBuffer* XvbmBufferPool::get_buffer_handle(uint32_t index)
+{
+    XvbmBuffer *buffer = (XvbmBuffer*)NULL;
+
+    std::lock_guard<std::mutex> guard(m_lock);
+    buffer = m_alloc_vector.at(index);
+    
+    return buffer;
+}
+
+uint32_t xvbm_get_freelist_count(XvbmPoolHandle p_handle)
+{
+   XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+   return pool->get_freelist_count();
+}
+
+/* XHD CHANGES END */
+
+XvbmBufferHandle xvbm_get_buffer_handle(XvbmPoolHandle p_handle, uint32_t index)
+{
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    XvbmBuffer *buffer = pool->get_buffer_handle(index);
+
+    return buffer;
+}
+/* XHD CHANGES END */
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for writing a device buffer 
+//////////////////////////////////////////////////////////////////////////////
+int32_t XvbmBuffer::write_buffer(const void *src,
+                                 size_t      size,
+                                 size_t      offset)
+{
+    XvbmPoolHandle p_handle = get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    int32_t rc;
+    std::string err = "xclSyncBO to device failed rc=";
+
+    rc = xclSyncBO(pool->m_dev_handle,
+                   m_bo_handle,
+                   XCL_BO_SYNC_BO_TO_DEVICE,
+                   size,
+                   offset);
+    if (rc != 0)
+        std::cout << err << rc << std::endl;
+
+    return rc;
+    
+}
+
+//////////////////////////////////////////////////////////////////////////////
+// Class method for reading a device buffer 
+//////////////////////////////////////////////////////////////////////////////
+int32_t XvbmBuffer::read_buffer(void       *dst,
+                                size_t      size,
+                                size_t      offset)
+{
+    XvbmPoolHandle p_handle = get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    int32_t rc = 0;
+    std::string err = "xclSyncBO from device failed rc=";
+
+    std::lock_guard<std::mutex> guard(m_rdlock);
+
+    //if there is at-least 1 ref and buffer has not been read before
+    if((m_ref_cnt) && (!m_hbuf_valid)) {
+        rc = xclSyncBO(pool->m_dev_handle,
+                       m_bo_handle,
+                       XCL_BO_SYNC_BO_FROM_DEVICE,
+                       size,
+                       offset);
+        if (rc != 0)
+            std::cout << err << rc << std::endl;
+
+        m_hbuf_valid = true;
+    }
+
+    return rc;
+    
+}
+    
+//////////////////////////////////////////////////////////////////////////////
+XvbmPoolHandle xvbm_buffer_pool_create(xclDeviceHandle d_handle,
+                                       int32_t         num_buffers,
+                                       size_t          size,
+                                       uint32_t        flags)
+{
+    XvbmBufferPool *pool = new XvbmBufferPool(d_handle,
+                                              num_buffers,
+                                              size,
+                                              flags);
+    try {
+        pool->create();
+    } catch (const std::bad_alloc&) {
+        std::cout << "xrt : failed to create a pool" << std::endl;
+        pool = nullptr;
+    }
+    return pool;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+XvbmPoolHandle xvbm_buffer_pool_create_by_device_id(int32_t  device_id,
+                                                    int32_t  num_buffers,
+                                                    size_t   size,
+                                                    uint32_t flags)
+{
+    xclDeviceHandle d_handle = xclOpen(device_id, NULL, XCL_QUIET);
+    return xvbm_buffer_pool_create(d_handle, num_buffers, size, flags);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+void xvbm_buffer_pool_offsets_set(XvbmPoolHandle p_handle,
+                                  uint32_t       *offsets,
+                                  uint32_t       num_offsets)
+{
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    for ( uint32_t i = 0; i < num_offsets; i++)
+        pool->set_offset(offsets[i]);
+    
+}
+
+//////////////////////////////////////////////////////////////////////////////
+uint32_t xvbm_buffer_pool_offset_get(XvbmBufferHandle b_handle,
+                                     uint32_t         offset_idx) 
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    return pool->get_offset(offset_idx);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+int32_t xvbm_buffer_pool_extend(XvbmBufferHandle  b_handle,
+                                int32_t           num_buffers)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    int32_t ret;
+    try {
+        ret = pool->extend(num_buffers);
+    } catch (const std::bad_alloc&)
+    {
+        std::cout << "xrt : failed to extend/allocate memory" << std::endl;
+        ret = 0;
+    }
+    return ret;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+int32_t xvbm_buffer_pool_num_buffers_get(XvbmBufferHandle  b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    return pool->get_num_buffers();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+XvbmBufferHandle xvbm_buffer_pool_entry_alloc(XvbmPoolHandle p_handle)
+{
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    XvbmBuffer *buffer = pool->entry_alloc();
+
+    return buffer;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+bool xvbm_buffer_pool_entry_free(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    return pool->entry_free(buffer);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+void xvbm_buffer_pool_destroy(XvbmPoolHandle p_handle)
+{
+    // Don't do anything for now since this can cause buffers to be
+    // freed in midstream and result in a segfault.  Need a way to
+    // defer the destroy once all buffers have no reference count.
+    // This could be done using an async thread along with a queue
+    // that performs cleanup.
+}
+
+//////////////////////////////////////////////////////////////////////////////
+uint32_t xvbm_buffer_get_bo_handle(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    return buffer->get_bo_handle();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+uint32_t xvbm_buffer_get_id(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    return buffer->get_id();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+size_t xvbm_buffer_get_size(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    return buffer->get_size();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+uint64_t xvbm_buffer_get_paddr(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    return buffer->get_paddr();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+void *xvbm_buffer_get_host_ptr(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+    return buffer->get_host_ptr();
+}
+
+//////////////////////////////////////////////////////////////////////////////
+XvbmBufferHandle xvbm_buffer_get_handle(XvbmPoolHandle p_handle, 
+                                        uint64_t       paddr)
+{
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    XvbmBuffer *buffer = pool->get_handle_by_paddr(paddr); 
+    return buffer;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+uint32_t xvbm_buffer_get_refcnt(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+    return(buffer->m_ref_cnt);
+}
+
+//////////////////////////////////////////////////////////////////////////////
+void xvbm_buffer_refcnt_inc(XvbmBufferHandle b_handle)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle); 
+    XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+
+    std::lock_guard<std::mutex> guard(pool->m_lock);
+    ++buffer->m_ref_cnt;
+}
+
+//////////////////////////////////////////////////////////////////////////////
+int32_t xvbm_buffer_write(XvbmBufferHandle  b_handle,
+                          const void       *src,
+                          size_t            size,
+                          size_t            offset)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+
+    if (buffer->get_host_ptr() != src)   return(-1);
+    return buffer->write_buffer(src, size, offset); 
+} 
+
+//////////////////////////////////////////////////////////////////////////////
+int32_t xvbm_buffer_read(XvbmBufferHandle  b_handle,
+                         void             *dst,
+                         size_t            size,
+                         size_t            offset)
+{
+    XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+    if (buffer->get_host_ptr() != dst)   return(-1);
+    return buffer->read_buffer(dst, size, offset); 
+} 
