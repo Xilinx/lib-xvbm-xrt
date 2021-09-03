@@ -23,6 +23,12 @@
 #include <mutex>
 #include <xclhal2.h>
 
+//@TODO decouple XvbmBuffer/XvbmBufferPool
+
+/* @TODO
+    All members need not be public
+*/
+
 typedef struct XvbmBuffer
 {
     XvbmPoolHandle        m_p_handle;
@@ -41,10 +47,10 @@ typedef struct XvbmBuffer
                size_t         size,
                uint64_t       paddr,
                void          *hptr) :
-                   m_p_handle(p_handle), 
+                   m_p_handle(p_handle),
                    m_bo_handle(bo_handle),
-                   m_buffer_id(buffer_id), 
-                   m_size(size), 
+                   m_buffer_id(buffer_id),
+                   m_size(size),
                    m_paddr(paddr),
                    m_hptr(hptr),
                    m_ref_cnt(0),
@@ -80,8 +86,9 @@ typedef struct XvbmBufferPool
     size_t                               m_size;
     uint32_t                             m_flags;
     std::vector<uint32_t>                m_offsets;
+    uint32_t                             m_ref_cnt;
     std::mutex                           m_lock;
- 
+
     std::vector<XvbmBuffer*>             m_alloc_vector;
     std::map<uint64_t, XvbmBuffer*>      m_paddr_map;
     std::list<XvbmBuffer*>               m_free_list;
@@ -94,7 +101,8 @@ typedef struct XvbmBufferPool
                        m_dev_handle(dev_handle),
                        m_num_buffers(num_buffers),
                        m_size(size),
-                       m_flags(flags) {}
+                       m_flags(flags),
+                       m_ref_cnt(1) {}
 
     ~XvbmBufferPool() {}
 
@@ -108,11 +116,9 @@ typedef struct XvbmBufferPool
     bool entry_free(XvbmBuffer *buffer);
     XvbmBuffer* get_handle_by_paddr(uint64_t paddr);
     void destroy();
-    /* XHD CHANGES */
     XvbmBuffer* get_buffer_handle(uint32_t index);
     uint32_t get_freelist_count() { return m_free_list.size(); }
-    /* XHD CHANGES END */
-
+    bool destroy_l();
 } XvbmBufferPool;
-    
+
 #endif

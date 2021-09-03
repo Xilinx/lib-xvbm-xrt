@@ -194,12 +194,10 @@ void xvbm_buffer_refcnt_inc(XvbmBufferHandle b_handle);
 */
 uint32_t xvbm_buffer_get_refcnt(XvbmBufferHandle b_handle);
 
-/* XHD CHANGES */
 XvbmPoolHandle xvbm_get_pool_handle(XvbmBufferHandle b_handle);
 XvbmBufferHandle xvbm_get_buffer_handle(XvbmPoolHandle p_handle,
 					uint32_t index);
 uint32_t xvbm_get_freelist_count(XvbmPoolHandle p_handle);
-/* XHD CHANGES END*/
 
 /**
  * Get the host buffer handle

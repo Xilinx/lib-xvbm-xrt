@@ -68,7 +68,7 @@ endif()
 
 # Packaging section
 set(CPACK_PACKAGE_NAME "${PROJECT_NAME}")
-set(CPACK_PACKAGE_VERSION "1.0.0")
+set(CPACK_PACKAGE_VERSION "1.0.1")
 set(CPACK_PACKAGE_CONTACT "John Nichols <jnichol@xilinx.com>")
 set(CPACK_PACKAGE_VENDOR "Xilinx")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Xilinx Video Buffer Manager (XVBM)")
