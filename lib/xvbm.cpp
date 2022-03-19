@@ -31,37 +31,37 @@ XvbmBuffer* XvbmBufferPool::create_buffer(int32_t index)
     int rc = -1;
 
     //allocate host buffer (4K aligned)
+    /*@TODO Do not allocate host buffer when not required.
+        'flags' argument for 'DDR bank to allocate buffer' is not being used.
+        Maybe that can be re-used to specify type of buffers like
+        Device-only, Host+device etc.
+        Host buffer is required in cases where:
+        1. Padding needs to be done on the host side before sending
+           the buffer to the device side.
+        2. The user provided host buffer is not aligned at 4K
+    */
     if(posix_memalign(&host_ptr, ALIGN_4K, m_size)) {
         std::cout << "xvbm : aligned alloc failed" << std::endl;
         throw std::bad_alloc();
     }
     memset(host_ptr, 0, m_size);
 
-    bo_handle = xclAllocUserPtrBO(m_dev_handle,
-                                  host_ptr,
-                                  m_size,
-                                  m_flags);
+    bo_handle = xclAllocBO(m_dev_handle, m_size, 0, XCL_BO_FLAGS_DEV_ONLY);
     if (bo_handle == NULLBO) {
-        std::cout << "xvbm : xclAllocBO failed" << std::endl;
-        throw std::bad_alloc();
-    }
-
-    rc = xclSyncBO(m_dev_handle,
-                   bo_handle,
-                   XCL_BO_SYNC_BO_TO_DEVICE,
-                   m_size,
-                   0);
-
-    if (rc != 0) {
-        std::cout << "xvbm : initialize device buffer with 0 failed" << std::endl;
-        xclFreeBO(m_dev_handle, bo_handle);
-        free(host_ptr);
+        std::cerr << "xvbm : xclAllocBO failed" << std::endl;
         throw std::bad_alloc();
     }
 
     uint64_t paddr = xclGetDeviceAddr(m_dev_handle, bo_handle);
     XvbmBuffer *buffer = new XvbmBuffer(this, bo_handle, index, m_size, paddr, host_ptr);
     assert(buffer != nullptr);
+
+    if (buffer->write_buffer(host_ptr, m_size, 0)) {
+        delete buffer;
+        free(host_ptr);
+        throw std::bad_alloc();
+    }
+
     m_alloc_vector.push_back(buffer);
     m_paddr_map.insert(std::pair<uint64_t, XvbmBuffer*>(paddr, buffer));
     m_free_list.push_back(buffer);
@@ -83,7 +83,7 @@ void XvbmBufferPool::create()
         try {
             create_buffer(i);
         } catch (const std::bad_alloc&) {
-            std::cout <<  "buffer #" << i << "failed" << std::endl;
+            std::cerr <<  "buffer #" << i << "failed" << std::endl;
             throw std::bad_alloc();
         }
     }
@@ -153,7 +153,7 @@ int32_t XvbmBufferPool::extend(int32_t num_buffers)
 }
 
 //////////////////////////////////////////////////////////////////////////////
-// Class method for allocating a buffer from the buffer pool 
+// Class method for allocating a buffer from the buffer pool
 //////////////////////////////////////////////////////////////////////////////
 XvbmBuffer* XvbmBufferPool::entry_alloc()
 {
@@ -166,7 +166,6 @@ XvbmBuffer* XvbmBufferPool::entry_alloc()
         buffer = m_free_list.front();
         ++buffer->m_ref_cnt;
         std::lock_guard<std::mutex> guard(buffer->m_rdlock);
-        buffer->m_hbuf_valid = false;
         m_free_list.pop_front();
         m_inuse_list.push_back(buffer);
         m_ref_cnt++;
@@ -261,18 +260,29 @@ int32_t XvbmBuffer::write_buffer(const void *src,
                                  size_t      size,
                                  size_t      offset)
 {
-    XvbmPoolHandle p_handle = get_pool_handle();
-    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(m_p_handle);
     int32_t rc;
-    std::string err = "xclSyncBO to device failed rc=";
 
-    rc = xclSyncBO(pool->m_dev_handle,
-                   m_bo_handle,
-                   XCL_BO_SYNC_BO_TO_DEVICE,
-                   size,
-                   offset);
-    if (rc != 0)
+
+    if (m_size < (size+offset)) {
+        std::cerr << "write_buffer with invalid size:" << size << " offset:" << offset <<std::endl;
+        return (-1);
+    }
+
+    // Check if the user provided host buffer is 4k aligned
+    if ((size_t)src & 0xFFF) {
+        void *aligned_src = (unsigned char*)m_hptr + offset;
+        memcpy(aligned_src, src, size);
+        rc = xclWriteBO(pool->m_dev_handle,
+                        m_bo_handle, aligned_src, size, offset);
+    } else {
+        rc = xclWriteBO(pool->m_dev_handle,
+                        m_bo_handle, src, size, offset);
+    }
+    if (rc != 0) {
+        std::string err = "xclSyncBO to device failed rc=";
         std::cerr << err << rc << std::endl;
+    }
 
     return rc;
 
@@ -285,28 +295,34 @@ int32_t XvbmBuffer::read_buffer(void       *dst,
                                 size_t      size,
                                 size_t      offset)
 {
-    XvbmPoolHandle p_handle = get_pool_handle();
-    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
+    XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(m_p_handle);
     int32_t rc = 0;
-    std::string err = "xclSyncBO from device failed rc=";
 
     std::lock_guard<std::mutex> guard(m_rdlock);
 
-    //if there is at-least 1 ref and buffer has not been read before
-    if((m_ref_cnt) && (!m_hbuf_valid)) {
-        rc = xclSyncBO(pool->m_dev_handle,
-                       m_bo_handle,
-                       XCL_BO_SYNC_BO_FROM_DEVICE,
-                       size,
-                       offset);
-        if (rc != 0)
-            std::cerr << err << rc << std::endl;
-
-        m_hbuf_valid = true;
+    if (m_size < (size+offset)) {
+        std::cerr << "read_buffer with invalid size:" << size << " offset:" << offset <<std::endl;
+        return (-1);
+    }
+    //if there is at-least 1 ref
+    if(m_ref_cnt) {
+        // Check if the user provided host buffer is 4k aligned
+        if ((size_t)dst & 0xFFF) {
+            void *aligned_dst = (unsigned char*)m_hptr + offset;
+            rc = xclReadBO(pool->m_dev_handle, m_bo_handle, aligned_dst, size, offset);
+            if (rc == 0) {
+                memcpy(dst, aligned_dst, size);
+            }
+        } else {
+            rc = xclReadBO(pool->m_dev_handle, m_bo_handle, dst, size, offset);
+        }
+    }
+    if (rc != 0) {
+        std::string err = "xclSyncBO from device failed rc=";
+        std::cerr << err << rc << std::endl;
     }
 
     return rc;
-
 }
 
 //////////////////////////////////////////////////////////////////////////////
@@ -408,7 +424,15 @@ XvbmBufferHandle xvbm_buffer_pool_entry_alloc(XvbmPoolHandle p_handle)
 bool xvbm_buffer_pool_entry_free(XvbmBufferHandle b_handle)
 {
     XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
+    if (buffer == NULL) {
+        std::cerr << "Warning: xvbm trying to free a buffer which is already null" << std::endl;
+        return true;
+    }
     XvbmPoolHandle p_handle = buffer->get_pool_handle();
+    if (p_handle == NULL) {
+        std::cerr << "Warning : xvbm buffer pool has already destroyed" << std::endl;
+        return true;
+    }
     XvbmBufferPool *pool = static_cast<XvbmBufferPool*>(p_handle);
     return pool->entry_free(buffer);
 }
@@ -502,7 +526,7 @@ int32_t xvbm_buffer_write(XvbmBufferHandle  b_handle,
 {
     XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
 
-    if (buffer->get_host_ptr() != src)   return(-1);
+    //if (buffer->get_host_ptr() != src)   return(-1);
     return buffer->write_buffer(src, size, offset);
 }
 
@@ -513,6 +537,6 @@ int32_t xvbm_buffer_read(XvbmBufferHandle  b_handle,
                          size_t            offset)
 {
     XvbmBuffer *buffer = static_cast<XvbmBuffer*>(b_handle);
-    if (buffer->get_host_ptr() != dst)   return(-1);
+    //if (buffer->get_host_ptr() != dst)   return(-1);
     return buffer->read_buffer(dst, size, offset);
 }

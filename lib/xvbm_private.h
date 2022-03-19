@@ -38,7 +38,6 @@ typedef struct XvbmBuffer
     uint64_t              m_paddr;
     void                 *m_hptr;
     uint32_t              m_ref_cnt;
-    bool                  m_hbuf_valid;
     std::mutex            m_rdlock;
 
     XvbmBuffer(XvbmPoolHandle p_handle,
@@ -53,8 +52,7 @@ typedef struct XvbmBuffer
                    m_size(size),
                    m_paddr(paddr),
                    m_hptr(hptr),
-                   m_ref_cnt(0),
-                   m_hbuf_valid(0) {}
+                   m_ref_cnt(0) {}
 
     ~XvbmBuffer() {}
 

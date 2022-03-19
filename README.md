@@ -9,8 +9,8 @@ Apache License, Version 2.0.
 
 
 
-## xvbm
-### Build
+# xvbm
+## Build
 Build with make DEB
-### Install
+## Install
 sudo apt install ./DEB_Release/*.deb
