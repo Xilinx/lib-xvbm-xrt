@@ -15,21 +15,44 @@ set(XVBM_LIB_NAME "xvbm")
 find_program(UNAME_EXEC uname)
 find_program(LSB_RELEASE_EXEC lsb_release)
 
-execute_process(COMMAND ${UNAME_EXEC} -p
-    OUTPUT_VARIABLE UNAME_ARCHTYPE
+execute_process(COMMAND ${LSB_RELEASE_EXEC} -is
+    OUTPUT_VARIABLE LINUX_FLAVOR
     OUTPUT_STRIP_TRAILING_WHITESPACE
 )
+
+if (${LINUX_FLAVOR} MATCHES "^(Ubuntu|Debian)")
+        # amd64
+        execute_process(
+        COMMAND dpkg --print-architecture
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+elseif (${LINUX_FLAVOR} MATCHES "^(RedHat|CentOS|Amazon|Fedora|SUSE)")
+        # x86_64
+        execute_process(
+        COMMAND uname -m
+        OUTPUT_VARIABLE CPACK_ARCH
+        OUTPUT_STRIP_TRAILING_WHITESPACE
+        )
+else()
+        message( SEND_ERROR "Trying to build on incompatible system \"${LINUX_FLAVOR}\"." )
+endif()
+
+# Grab OS release short name
 execute_process(COMMAND ${LSB_RELEASE_EXEC} -rs
-    OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-)
+        OUTPUT_VARIABLE LSB_RELEASE_REL_SHORT
+        OUTPUT_STRIP_TRAILING_WHITESPACE)
+
+if (${LINUX_FLAVOR} MATCHES "^Amazon")
+        set(LSB_RELEASE_REL_SHORT "amzn${LSB_RELEASE_REL_SHORT}")
+endif()
 
 project(${XVBM_PROJ})
 
 # Packaging section
 set(CPACK_PACKAGE_NAME ${XVBM_PROJ})
-set(CPACK_PACKAGE_VERSION "1.0.2")
-set(CPACK_PACKAGE_FILE_NAME "${XVBM_PROJ}_${CPACK_PACKAGE_VERSION}_${LSB_RELEASE_REL_SHORT}-${UNAME_ARCHTYPE}")
+set(CPACK_PACKAGE_VERSION "1.0.3")
+set(CPACK_PACKAGE_FILE_NAME "${XVBM_PROJ}_${CPACK_PACKAGE_VERSION}_${LSB_RELEASE_REL_SHORT}-${CPACK_ARCH}")
 set(CPACK_PACKAGE_CONTACT "John Nichols <jnichol@xilinx.com>")
 set(CPACK_PACKAGE_VENDOR "Xilinx")
 set(CPACK_PACKAGE_DESCRIPTION_SUMMARY "Xilinx Video Buffer Manager (XVBM)")
@@ -37,8 +60,8 @@ set(CPACK_PACKAGE_DESCRIPTION "The XVBM manages shared device buffers
                                among kernels for zero-copy")
 
 set(CPACK_DEBIAN_PACKAGE_DEPENDS "xrt (>= 2.11)")
-set(CPACK_RPM_PACKAGE_DEPENDS "xrt >= 2.11")
-set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig")
+set(CPACK_RPM_PACKAGE_REQUIRES "xrt >= 2.11")
+set(CPACK_RPM_EXCLUDE_FROM_AUTO_FILELIST_ADDITION "/opt" "/opt/xilinx" "/usr/lib" "/usr/lib/pkgconfig" "/usr/share/doc/xilinx" "/usr/share/doc/xilinx/u30")
 include(CPack)
 
 set(ENV{PKG_CONFIG_PATH} "$ENV{PKG_CONFIG_PATH}:/usr/lib/pkgconfig")
@@ -47,6 +70,8 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 set(CMAKE_MODULE_PATH ${PROJECT_SOURCE_DIR}/CMakeModules)
+set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_CURRENT_SOURCE_DIR}/LICENSE")
+set(CPACK_FILE_LICENSE_PATH "/usr/share/doc/amd/u30")
 
 if(CMAKE_BUILD_TYPE STREQUAL "Debug" AND CMAKE_COMPILER_IS_GNUCXX)
     include(CodeCoverage)
@@ -87,6 +112,7 @@ install(TARGETS ${XVBM_LIB_NAME} DESTINATION ${CMAKE_INSTALL_PREFIX}/lib)
 install(DIRECTORY ${CMAKE_SOURCE_DIR}/include/
         DESTINATION ${CMAKE_INSTALL_PREFIX}/include
         FILES_MATCHING PATTERN "*.h")
+install(FILES ${CPACK_RESOURCE_FILE_LICENSE} DESTINATION ${CPACK_FILE_LICENSE_PATH}/xvbm)
 
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     configure_file(${CMAKE_SOURCE_DIR}/lib/xvbm.pc.in
